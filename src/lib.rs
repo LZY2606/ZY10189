@@ -80,6 +80,12 @@
 //! The [`cache`] module provides means for speeding up read access of the contained data at the
 //! cost of delayed reclamation.
 //!
+//! The [`observation`] module provides generation tokens ([`Observation`]) that identify a
+//! particular publication of a value. [`load_observed`][ArcSwapAny::load_observed] captures such
+//! a token and [`compare_exchange_observed`][ArcSwapAny::compare_exchange_observed] commits a
+//! conditional update only while that exact publication is still current, which detects ABA even
+//! when an address is reused.
+//!
 //! The [`access`] module can be used to do projections into the contained data to separate parts
 //! of application from each other (eg. giving a component access to only its own part of
 //! configuration while still having it reloaded as a whole).
@@ -143,6 +149,7 @@ pub mod cache;
 mod compile_fail_tests;
 mod debt;
 pub mod docs;
+pub mod observation;
 mod ref_cnt;
 #[cfg(feature = "serde")]
 mod serde;
@@ -166,13 +173,15 @@ use core::marker::PhantomData;
 use core::mem;
 use core::ops::Deref;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use crate::imports::Arc;
 
 use crate::access::{Access, Map};
 pub use crate::as_raw::AsRaw;
 pub use crate::cache::Cache;
+pub use crate::observation::Observation;
+use crate::observation::GENERATION_SATURATED;
 pub use crate::ref_cnt::RefCnt;
 use crate::strategy::hybrid::{DefaultConfig, HybridStrategy};
 use crate::strategy::sealed::Protected;
@@ -255,6 +264,53 @@ impl<T: Display + RefCnt, S: Strategy<T>> Display for Guard<T, S> {
     }
 }
 
+/// A tiny per-instance spin lock guarding the "publication" step (pointer swap + generation
+/// bump).
+///
+/// Only writers take it, and only for the two atomic instructions themselves; reclamation of the
+/// old pointer (`wait_for_readers`) happens *after* it is released. Ordinary readers therefore
+/// never contend on it.
+struct WriteGuard<'a> {
+    lock: &'a AtomicBool,
+}
+
+impl<'a> WriteGuard<'a> {
+    #[inline]
+    fn lock(lock: &'a AtomicBool) -> Self {
+        // Try the fast path first, then spin. Writers are rare by design, so we don't need
+        // anything fancier.
+        while lock
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            let mut spins = 0u32;
+            while lock.load(Ordering::SeqCst) {
+                if spins < 64 {
+                    spins += 1;
+                    core::sync::atomic::spin_loop_hint();
+                } else {
+                    // Yield to the scheduler once spinning stops helping. std::thread::yield_now is
+                    // available on all platforms with std; the no_std experimental build uses
+                    // only the spinning branch because writers are extremely short.
+                    #[cfg(not(feature = "experimental-thread-local"))]
+                    std::thread::yield_now();
+                    #[cfg(feature = "experimental-thread-local")]
+                    core::sync::atomic::spin_loop_hint();
+                    spins = 0;
+                }
+            }
+        }
+        WriteGuard { lock }
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.lock.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Comparison of two pointer-like things.
 // A and B are likely to *be* references, or thin wrappers around that. Calling that with extra
 // reference is just annoying.
@@ -328,6 +384,17 @@ pub struct ArcSwapAny<T: RefCnt, S: Strategy<T> = DefaultStrategy> {
     /// The actual pointer, extracted from the Arc.
     ptr: AtomicPtr<T::Base>,
 
+    // Generation of the current publication. Bumped (saturatingly) after every successful
+    // publication while `write_lock` is held. See the `observation` module for the full
+    // semantics. Reads by the ordinary API never touch this; the layout addition is the only cost
+    // paid by users who don't use the observation API.
+    generation: AtomicUsize,
+
+    // A tiny per-instance spin lock serializing publications (swap / compare_and_swap / the
+    // observed variant). It makes the pointer publication and the generation bump one indivisible
+    // step that `load_observed` can reason about. Ordinary readers never take it.
+    write_lock: AtomicBool,
+
     /// We are basically an Arc in disguise. Inherit parameters from Arc by pretending to contain
     /// it.
     _phantom_arc: PhantomData<T>,
@@ -398,6 +465,8 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
         let ptr = T::into_ptr(val);
         Self {
             ptr: AtomicPtr::new(ptr),
+            generation: AtomicUsize::new(0),
+            write_lock: AtomicBool::new(false),
             _phantom_arc: PhantomData,
             strategy,
         }
@@ -474,6 +543,96 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
         Guard { inner: protected }
     }
 
+    /// Bumps the publication generation, saturating at `GENERATION_SATURATED`.
+    ///
+    /// Must be called while the `write_lock` is held, after the pointer publication and before
+    /// the lock is released.
+    #[inline]
+    fn bump_generation(&self) {
+        loop {
+            let current = self.generation.load(Ordering::SeqCst);
+            if current == GENERATION_SATURATED {
+                return;
+            }
+            if self
+                .generation
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Loads the value together with its generation token.
+    ///
+    /// This is the observation-counterpart of [`load`](#method.load): in addition to the
+    /// temporary [`Guard`] of the current value, it returns an [`Observation`] that identifies
+    /// this particular publication. The token can later be handed to
+    /// [`compare_exchange_observed`](#method.compare_exchange_observed) to make sure the value has
+    /// not been replaced in the meantime — including an ABA situation where the address was
+    /// reused.
+    ///
+    /// The `Observation` itself does *not* keep the value alive (it contains only the address and
+    /// a generation number). Only the returned [`Guard`] offers the usual short-term protection;
+    /// once it is dropped the value may be freed even while the token is still being carried
+    /// around. That is fine — a freed-and-reused address simply won't carry the same generation.
+    ///
+    /// # Semantics
+    ///
+    /// * The returned pair is *verify-coherent*: it is a state that the storage either currently
+    ///   contains or has already passed. A conditional commit re-checks both the address and the
+    ///   generation while holding the publication lock, so a token captured at the trailing edge
+    ///   of a concurrent publication can only make the commit fail spuriously, never succeed for a
+    ///   publication that is no longer current.
+    /// * Two [`load`](#method.load)-like accesses that observe the same publication produce
+    ///   observations that are equal ([`PartialEq`] on [`Observation`]).
+    /// * Storing the *same* [`Arc`] instance twice still creates a new generation (every
+    ///   successful publication bumps it), and storing a different `Arc` at a reused address
+    ///   creates a new generation as well.
+    /// * A `None` value of [`ArcSwapOption`](type.ArcSwapOption.html) is a full-fledged
+    ///   publication with its own generation — replacing `Some` with `None` and back changes the
+    ///   generation on every step.
+    ///
+    /// # Complexity & ordering
+    ///
+    /// Same cost class as [`load`](#method.load) (one debt-protected load) plus two `SeqCst`
+    /// loads of a small per-instance generation counter. It never allocates and takes no locks.
+    /// See the [`observation`] module for the generation width and saturation boundary.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use arc_swap::ArcSwap;
+    /// let shared = ArcSwap::from_pointee(1);
+    /// let (guard, observation) = shared.load_observed();
+    /// assert_eq!(1, **guard);
+    /// assert!(shared.compare_exchange_observed(observation, Arc::new(2)).is_ok());
+    /// ```
+    ///
+    /// [`observation`]: crate::observation
+    pub fn load_observed(&self) -> (Guard<T, S>, Observation<T>) {
+        loop {
+            // SeqCst before, SeqCst after the protected load. If they are equal, the total order
+            // of the generation counter (bumped under the write lock by every successful
+            // publication) guarantees no publication happened "between" them, hence the protected
+            // pointer is the one of that generation.
+            let generation_before = self.generation.load(Ordering::SeqCst);
+            let protected = unsafe { self.strategy.load(&self.ptr) };
+            let generation_after = self.generation.load(Ordering::SeqCst);
+            if generation_before == generation_after {
+                let ptr = T::as_ptr(protected.borrow());
+                return (
+                    Guard { inner: protected },
+                    Observation::new(ptr, generation_after),
+                );
+            }
+            // A publication was in flight; discard the protection and try again.
+            drop(Guard::<T, S> { inner: protected });
+        }
+    }
+
     /// Replaces the value inside this instance.
     ///
     /// Further loads will yield the new value. Uses [`swap`](#method.swap) internally.
@@ -483,12 +642,18 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
 
     /// Exchanges the value inside this instance.
     pub fn swap(&self, new: T) -> T {
+        let _write_guard = WriteGuard::lock(&self.write_lock);
         let new = T::into_ptr(new);
         // AcqRel needed to publish the target of the new pointer and get the target of the old
         // one.
         //
         // SeqCst to synchronize the time lines with the group counters.
         let old = self.ptr.swap(new, Ordering::SeqCst);
+        // Bump the generation *before* releasing the write lock, so any observer that sees the
+        // new pointer also sees the new generation and vice versa (modulo the documented retry in
+        // `load_observed`). Saturating — see the observation module for the boundary.
+        self.bump_generation();
+        drop(_write_guard);
         unsafe {
             self.strategy.wait_for_readers(old, &self.ptr);
             T::from_ptr(old)
@@ -516,8 +681,104 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
         C: AsRaw<T::Base>,
         S: CaS<T>,
     {
+        let _write_guard = WriteGuard::lock(&self.write_lock);
+        let expected = current.as_raw();
         let protected = unsafe { self.strategy.compare_and_swap(&self.ptr, current, new) };
+        // The strategy returns the value that is current after the operation. It equals the
+        // expected pointer iff the swap actually happened, in which case this is a new
+        // publication and the generation must advance.
+        if T::as_ptr(protected.borrow()) == expected {
+            self.bump_generation();
+        }
         Guard { inner: protected }
+    }
+
+    /// Conditionally exchanges the value using a generation [`Observation`].
+    ///
+    /// Unlike the address-only [`compare_and_swap`](#method.compare_and_swap), this commits only
+    /// if the storage is still at the *exact publication* the token describes — same address
+    /// **and** same generation. This defeats ABA: if the value changed away and back (even to a
+    /// re-used allocation at the same address), the generation differs and the update is refused.
+    ///
+    /// On success, returns `Ok(guard)` with a [`Guard`] of the previous value (the one described
+    /// by the token) and `new` becomes the current publication, with a fresh generation. On
+    /// failure, nothing is stored and `Err(current)` is returned, where `current` is an
+    /// [`Observation`] of the publication found at verification time. Use
+    /// [`Observation::same_address`] on the returned observation to distinguish "the address
+    /// changed" from "same address, newer generation" (i.e. a detected ABA).
+    ///
+    /// # Semantics
+    ///
+    /// * Every *successful* call publishes a new generation, including storing the same [`Arc`].
+    /// * A failed call never changes the pointer, the generation or any reference count.
+    /// * Tokens obtained from a *different* [`ArcSwapAny`] never match.
+    /// * An observation taken at the [saturated](Observation::is_saturated) generation never
+    ///   matches; see the [`observation`] module for the width and wrap boundary.
+    ///
+    /// # Complexity & ordering
+    ///
+    /// This is a [`compare_and_swap`](#method.compare_and_swap) with an additional generation
+    /// verification, performed under the same per-instance publication lock used by all writers;
+    /// it is lock-free with respect to other readers and never blocks on debt reclamation. All
+    /// generation accesses are `SeqCst`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use arc_swap::ArcSwap;
+    /// let shared = ArcSwap::from_pointee(1);
+    /// let token = shared.load_observed().1;
+    ///
+    /// // Another publication happens in between, even back to the same value.
+    /// shared.store(Arc::new(2));
+    /// shared.store(Arc::new(1));
+    ///
+    /// // The stale token is refused, even though the numeric value is back.
+    /// let result = shared.compare_exchange_observed(token, Arc::new(3));
+    /// assert!(result.is_err());
+    /// assert_eq!(1, **shared.load());
+    ///
+    /// // A fresh token commits.
+    /// let fresh = shared.load_observed().1;
+    /// assert!(shared.compare_exchange_observed(fresh, Arc::new(3)).is_ok());
+    /// assert_eq!(3, **shared.load());
+    /// ```
+    pub fn compare_exchange_observed(
+        &self,
+        observation: Observation<T>,
+        new: T,
+    ) -> Result<Guard<T, S>, Observation<T>>
+    where
+        S: CaS<T>,
+    {
+        // A saturated observation can never have been taken at the current generation. Refusing
+        // up front also guarantees no token can become valid again after the counter stops.
+        if observation.is_saturated() {
+            return Err(self.load_observed().1);
+        }
+        let _write_guard = WriteGuard::lock(&self.write_lock);
+        let current_generation = self.generation.load(Ordering::SeqCst);
+        let current_ptr = self.ptr.load(Ordering::SeqCst);
+        if current_ptr != observation.ptr || current_generation != observation.generation {
+            return Err(Observation::new(current_ptr, current_generation));
+        }
+        // We are still at the observed publication. Delegate to the strategy's CAS, which handles
+        // the debt protection and reclamation of the old pointer. We hold the publication lock,
+        // so the only way this can fail to commit is a spurious compare_exchange_weak failure;
+        // the strategy loops internally in that case.
+        let protected = unsafe { self.strategy.compare_and_swap(&self.ptr, observation, new) };
+        if T::as_ptr(protected.borrow()) == observation.ptr {
+            self.bump_generation();
+            Ok(Guard { inner: protected })
+        } else {
+            // Defensive: cannot happen while the write lock is held, but report a coherent
+            // current observation rather than claiming success.
+            let gen = self.generation.load(Ordering::SeqCst);
+            let ptr = T::as_ptr(protected.borrow());
+            drop(Guard::<T, S> { inner: protected });
+            Err(Observation::new(ptr, gen))
+        }
     }
 
     /// Read-Copy-Update of the pointer inside.
@@ -793,6 +1054,8 @@ impl<T> ArcSwapOption<T> {
     pub const fn const_empty() -> Self {
         Self {
             ptr: AtomicPtr::new(ptr::null_mut()),
+            generation: AtomicUsize::new(0),
+            write_lock: AtomicBool::new(false),
             _phantom_arc: PhantomData,
             strategy: HybridStrategy {
                 _config: DefaultConfig,
@@ -1262,6 +1525,22 @@ mod internal_strategies {
         crate::strategy::test_strategies::FillFastSlots
     );
 }
+
+/// Test-only accessors for generation internals. Lives on the type itself so integration-style
+/// unit tests in this crate can exercise saturation without performing usize::MAX publications.
+#[cfg(test)]
+impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
+    fn force_generation(&self, generation: usize) {
+        self.generation.store(generation, Ordering::SeqCst);
+    }
+
+    fn current_generation(&self) -> usize {
+        self.generation.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod observation_tests;
 
 /// These tests assume details about the used strategy.
 #[cfg(test)]

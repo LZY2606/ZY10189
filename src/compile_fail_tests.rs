@@ -91,3 +91,20 @@
 //! let a: ArcSwapAny<Rc<usize>> = ArcSwapAny::new(Rc::new(42));
 //! std::thread::spawn(move || drop(a));
 //! ```
+//!
+//! An observation about a non-Send value can't cross a thread boundary, but one about an ordinary
+//! value can.
+//! ```rust,compile_fail
+//! use std::rc::Rc;
+//! use arc_swap::ArcSwapAny;
+//!
+//! let shared = ArcSwapAny::new(Rc::new(42));
+//! let observation = shared.load_observed().1;
+//! std::thread::spawn(move || drop(observation));
+//! ```
+//!
+//! ```rust
+//! let shared = arc_swap::ArcSwap::from_pointee(42);
+//! let observation = shared.load_observed().1;
+//! std::thread::spawn(move || { let _ = observation; }).join().unwrap();
+//! ```

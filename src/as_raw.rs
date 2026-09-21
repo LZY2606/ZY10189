@@ -1,6 +1,6 @@
 use super::{Guard, RefCnt};
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait Sealed {}
 }
 

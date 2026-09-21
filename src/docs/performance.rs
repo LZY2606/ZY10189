@@ -74,11 +74,30 @@
 //! cost of less comfortable API and possibly keeping the older values alive for longer than
 //! necessary.
 //!
+//! ## Generation observations
+//!
+//! [`load_observed`] has the same cost class as [`load`] (one debt-protected load) plus two
+//! `SeqCst` loads of a small per-instance generation counter. It never allocates and, just like
+//! [`load`], takes no lock. The returned [`Observation`] is a tiny `Copy` token that does not
+//! hold a reference count, so carrying it around doesn't keep the old value alive.
+//!
+//! [`compare_exchange_observed`] performs one ordinary
+//! [`compare_and_swap`]: crate::ArcSwapAny::compare_and_swap with an additional generation check,
+//! all while briefly holding the same per-instance publication spin-lock that every writer uses.
+//! The lock is taken only for the duration of the pointer swap and the generation bump and is
+//! released before waiting for readers, so it neither blocks ordinary readers nor serializes
+//! reclamation. Code that never calls the observed methods pays only for the extra two words in
+//! the [`ArcSwapAny`][crate::ArcSwapAny] layout and one locked store/`fetch_add` pair on the write path;
+//! [`load`]/[`load_full`] are unchanged.
+//!
 //! [`ArcSwap`]: crate::ArcSwap
 //! [`Cache`]: crate::cache::Cache
 //! [`Guard`]: crate::Guard
+//! [`Observation`]: crate::Observation
 //! [`load`]: crate::ArcSwapAny::load
 //! [`load_full`]: crate::ArcSwapAny::load_full
+//! [`load_observed`]: crate::ArcSwapAny::load_observed
+//! [`compare_exchange_observed`]: crate::ArcSwapAny::compare_exchange_observed
 //! [`Arc`]: std::sync::Arc
 //! [`Mutex`]: std::sync::Mutex
 //! [`RwLock`]: std::sync::RwLock

@@ -1,3 +1,14 @@
+# Unreleased
+
+* Add the generation-token observation API: `ArcSwapAny::load_observed` returning a
+  lightweight `Observation` (address + generation), and
+  `ArcSwapAny::compare_exchange_observed` for conditional updates that refuse stale tokens
+  across ABA (including address reuse and `Some`/`None` toggling). The generation is a
+  per-instance `usize`, bumped on every successful publication, that saturates at `usize::MAX`
+  instead of wrapping, so stale tokens are always detectable. Available for `ArcSwap`,
+  `ArcSwapOption` and, with the `weak` feature, `ArcSwapWeak`. Ordinary readers pay no
+  allocation or lock; publications serialize briefly on a new per-instance write spin-lock.
+
 # 1.9.2
 
 * Document RefCnt must not panic (#208).
