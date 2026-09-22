@@ -50,4 +50,28 @@
 //! # let _ = new;
 //! ```
 //!
+//! # Pointer comparison and the ABA problem
+//!
+//! The [`compare_and_swap`] method decides by comparing the *pointer*. If the stored value can
+//! go `A -> B -> A` between the load and the compare-and-swap (including the case where the old
+//! allocation was freed and its address got reused for a different value), the comparison can't
+//! tell that anything happened. Most of the time that is fine ‒ if the pointer is the same, the
+//! value is the same, so the outcome is equivalent.
+//!
+//! Sometimes, though, the caller needs to know that *its* observed generation is still the
+//! current one (eg. because the value carries meaning beyond the pointer identity, or because
+//! an update must be applied exactly once per observed state). For that, there's the
+//! [`load_observed`] / [`compare_exchange_observed`] pair: the former hands out an
+//! [`Observation`] token alongside the value, the latter commits only if that exact generation
+//! is still current. Every write operation (even storing the same [`Arc`] again) advances the
+//! generation, so the token can't be fooled by `A -> B -> A` switches. The generation counter
+//! is `usize`-wide and wraps around after `usize::MAX / 2 + 1` writes; tokens older than that
+//! may theoretically match again, which is the documented boundary of the guarantee ‒ see
+//! [`Observation`] for details.
+//!
 //! [`triomphe::ThinArc`]: https://docs.rs/triomphe/latest/triomphe/struct.ThinArc.html
+//! [`Arc`]: std::sync::Arc
+//! [`compare_and_swap`]: crate::ArcSwapAny::compare_and_swap
+//! [`compare_exchange_observed`]: crate::ArcSwapAny::compare_exchange_observed
+//! [`load_observed`]: crate::ArcSwapAny::load_observed
+//! [`Observation`]: crate::Observation

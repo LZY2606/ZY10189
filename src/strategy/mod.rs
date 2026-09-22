@@ -43,11 +43,10 @@ use crate::ref_cnt::RefCnt;
 
 pub(crate) mod hybrid;
 
-#[cfg(all(
-    feature = "internal-test-strategies",
-    feature = "experimental-thread-local"
-))]
-compile_error!("experimental-thread-local is incompatible with internal-test-strategies as it enables #[no_std]");
+// Note: `experimental-thread-local` enables `no_std`, but the test strategies in here need std.
+// If both features get enabled (eg. through `--all-features`), the test strategies take
+// precedence and `experimental-thread-local` is silently ignored (see the `cfg_attr`s in
+// `lib.rs`). This combination is not meant for production use anyway.
 
 #[cfg(feature = "internal-test-strategies")]
 mod rw_lock;

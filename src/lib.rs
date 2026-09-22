@@ -2,8 +2,23 @@
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![allow(deprecated)]
-#![cfg_attr(feature = "experimental-thread-local", no_std)]
-#![cfg_attr(feature = "experimental-thread-local", feature(thread_local))]
+// Note: `internal-test-strategies` needs std (for the `RwLock` strategy), so it takes
+// precedence over `experimental-thread-local` if someone enables both (eg. through
+// `--all-features`).
+#![cfg_attr(
+    all(
+        feature = "experimental-thread-local",
+        not(feature = "internal-test-strategies")
+    ),
+    no_std
+)]
+#![cfg_attr(
+    all(
+        feature = "experimental-thread-local",
+        not(feature = "internal-test-strategies")
+    ),
+    feature(thread_local)
+)]
 
 //! Making [`Arc`] itself atomic
 //!
@@ -166,7 +181,7 @@ use core::marker::PhantomData;
 use core::mem;
 use core::ops::Deref;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering};
 
 use crate::imports::Arc;
 
@@ -255,6 +270,161 @@ impl<T: Display + RefCnt, S: Strategy<T>> Display for Guard<T, S> {
     }
 }
 
+/// A token identifying one particular generation of the value inside an [`ArcSwapAny`].
+///
+/// Every time the value inside an [`ArcSwapAny`] is replaced (by [`store`], [`swap`],
+/// [`compare_and_swap`] or [`compare_exchange_observed`]), the storage moves to a new
+/// *generation*. An `Observation` captures the identity of one such generation ‒ both the
+/// pointer that was current and the generation number ‒ without keeping the value itself alive
+/// (it holds no reference count, no debt slot and no lock).
+///
+/// It is obtained by [`load_observed`] and can later be passed to
+/// [`compare_exchange_observed`] to perform a conditional update: „replace the value only if
+/// the generation I have observed is still the current one“. Unlike comparing raw pointers
+/// (with [`compare_and_swap`]), this is not confused by the `A-B-A` problem ‒ storing the very
+/// same [`Arc`] (or the very same address, after the allocator reused it) twice still produces
+/// a fresh generation each time, so a token from before the first store will not match.
+///
+/// # Generation width and wrap-around
+///
+/// The generation is a monotonically advancing counter of the pointer width of the platform
+/// (`usize`, therefore 64 bits on 64-bit platforms). Every successful modification consumes one
+/// generation. After `usize::MAX / 2 + 1` modifications the counter wraps around and a token
+/// that old could theoretically match again. On 64-bit platforms this needs `2^63` consecutive
+/// writes which is considered practically unreachable; on 32-bit platforms the limit is `2^31`
+/// writes. The crate does **not** claim to eliminate ABA beyond that bound ‒ if a token can
+/// legitimately outlive that many writes, re-observe instead of relying on an ancient token.
+/// Within the bound, a stale token is *always* detected and
+/// [`compare_exchange_observed`] fails.
+///
+/// # Notes
+///
+/// * An `Observation` is meaningful only for the single [`ArcSwapAny`] instance it was loaded
+///   from. Using it with a different instance is a logic error (it may spuriously fail or, if
+///   the generations coincidentally match, succeed) but not unsound.
+/// * The `None` value of an [`ArcSwapOption`] has its own generations too ‒ the generation
+///   tracks the *slot*, not the allocation.
+/// * Storing the same [`Arc`] twice in a row still advances the generation. The generation
+///   counts *write operations*, not distinct values.
+///
+/// [`store`]: ArcSwapAny::store
+/// [`swap`]: ArcSwapAny::swap
+/// [`compare_and_swap`]: ArcSwapAny::compare_and_swap
+/// [`compare_exchange_observed`]: ArcSwapAny::compare_exchange_observed
+/// [`load_observed`]: ArcSwapAny::load_observed
+/// [`ArcSwapOption`]: type.ArcSwapOption.html
+/// [`Arc`]: https://doc.rust-lang.org/std/sync/struct.Arc.html
+pub struct Observation<Base> {
+    /// The generation counter value at the time of the observation. Always even (odd values
+    /// mark a write in progress and are never observed).
+    gen: usize,
+
+    /// The raw pointer that was current at the time of the observation. Never dereferenced, it
+    /// serves only as part of the generation's identity (and for diagnostics).
+    ptr: usize,
+
+    /// Ties the token to the pointee type (for Send/Sync auto traits and type safety).
+    _phantom: PhantomData<Base>,
+}
+
+// Manual implementations, so no bounds on `Base` are imposed (the derived ones would require
+// `Base: Clone` etc., which is unnecessary for a token).
+impl<Base> Clone for Observation<Base> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Base> Copy for Observation<Base> {}
+
+impl<Base> Debug for Observation<Base> {
+    fn fmt(&self, formatter: &mut Formatter) -> FmtResult {
+        formatter
+            .debug_struct("Observation")
+            .field("gen", &self.gen)
+            .field("ptr", &self.ptr)
+            .finish()
+    }
+}
+
+impl<Base> PartialEq for Observation<Base> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.gen == other.gen && self.ptr == other.ptr
+    }
+}
+
+impl<Base> Eq for Observation<Base> {}
+
+impl<Base> Observation<Base> {
+    /// The generation number of this observation.
+    ///
+    /// This is mostly useful for diagnostics and debugging. Two observations of the same
+    /// [`ArcSwapAny`] can be ordered by their generation (the higher one is newer), as long as
+    /// the counter didn't wrap around in between (see the type-level documentation).
+    #[inline]
+    pub fn generation(&self) -> usize {
+        self.gen
+    }
+}
+
+/// The error returned by a failed [`compare_exchange_observed`].
+///
+/// It hands back everything needed to retry the operation: the current value (protected by a
+/// [`Guard`]), the [`Observation`] of the current generation and the `new` value that didn't
+/// get stored.
+///
+/// [`compare_exchange_observed`]: ArcSwapAny::compare_exchange_observed
+pub struct ObservedError<T: RefCnt, S: Strategy<T> = DefaultStrategy> {
+    /// The value that was current at the time of the failure.
+    current: Guard<T, S>,
+
+    /// The observation of the generation current at the time of the failure.
+    observation: Observation<T::Base>,
+
+    /// The value that was meant to be stored, returned back to the caller.
+    new: T,
+}
+
+impl<T: RefCnt, S: Strategy<T>> ObservedError<T, S> {
+    /// The value that was current at the time of the failed update.
+    #[inline]
+    pub fn current(&self) -> &Guard<T, S> {
+        &self.current
+    }
+
+    /// The observation of the generation that was current at the time of the failed update.
+    ///
+    /// This can be used directly for a retry of [`compare_exchange_observed`].
+    ///
+    /// [`compare_exchange_observed`]: ArcSwapAny::compare_exchange_observed
+    #[inline]
+    pub fn observation(&self) -> Observation<T::Base> {
+        self.observation
+    }
+
+    /// Takes the error apart into the current value, its observation and the returned `new`.
+    #[inline]
+    pub fn into_parts(self) -> (Guard<T, S>, Observation<T::Base>, T) {
+        (self.current, self.observation, self.new)
+    }
+}
+
+impl<T, S> Debug for ObservedError<T, S>
+where
+    T: Debug + RefCnt,
+    S: Strategy<T>,
+{
+    fn fmt(&self, formatter: &mut Formatter) -> FmtResult {
+        formatter
+            .debug_struct("ObservedError")
+            .field("current", &self.current)
+            .field("observation", &self.observation)
+            .finish()
+    }
+}
+
 /// Comparison of two pointer-like things.
 // A and B are likely to *be* references, or thin wrappers around that. Calling that with extra
 // reference is just annoying.
@@ -328,12 +498,59 @@ pub struct ArcSwapAny<T: RefCnt, S: Strategy<T> = DefaultStrategy> {
     /// The actual pointer, extracted from the Arc.
     ptr: AtomicPtr<T::Base>,
 
+    /// The generation of the currently stored value.
+    ///
+    /// Even values mean „quiescent“, odd values mean „a writer holds the claim and is just
+    /// now replacing the pointer“. Every completed modification advances it by 2. Writers
+    /// claim it (even -> odd) *before* touching `ptr` and release it (odd -> even) right
+    /// after, which lets readers take consistent (pointer, generation) snapshots in the
+    /// style of a seqlock and lets `compare_exchange_observed` make its commit decision
+    /// atomically on this single word.
+    gen: AtomicUsize,
+
     /// We are basically an Arc in disguise. Inherit parameters from Arc by pretending to contain
     /// it.
     _phantom_arc: PhantomData<T>,
 
     /// Strategy to protect the data.
     strategy: S,
+}
+
+/// A held write claim on the generation counter of an [`ArcSwapAny`].
+///
+/// While this exists, the generation is odd and no other writer may modify the pointer. The
+/// `Drop` implementation releases the claim conservatively (advancing the generation), so a
+/// panic in between can only cause spurious observation invalidations, never a stuck counter.
+struct GenClaim<'a> {
+    gen: &'a AtomicUsize,
+    /// The even value the counter had when it was claimed.
+    even: usize,
+}
+
+impl GenClaim<'_> {
+    /// Releases the claim after the pointer was modified, advancing to the next generation.
+    ///
+    /// Returns the new (current) generation.
+    fn release_changed(self) -> usize {
+        let next = self.even.wrapping_add(2);
+        self.gen.store(next, Ordering::SeqCst);
+        mem::forget(self);
+        next
+    }
+
+    /// Releases the claim without having modified anything, restoring the previous generation.
+    fn release_unchanged(self) {
+        self.gen.store(self.even, Ordering::SeqCst);
+        mem::forget(self);
+    }
+}
+
+impl Drop for GenClaim<'_> {
+    fn drop(&mut self) {
+        // Reached only on the panic paths ‒ the explicit releases above `forget` themselves.
+        // Conservatively advance the generation; a spurious invalidation is safe.
+        self.gen.store(self.even.wrapping_add(2), Ordering::SeqCst);
+    }
 }
 
 impl<T: RefCnt, S: Default + Strategy<T>> From<T> for ArcSwapAny<T, S> {
@@ -398,6 +615,7 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
         let ptr = T::into_ptr(val);
         Self {
             ptr: AtomicPtr::new(ptr),
+            gen: AtomicUsize::new(0),
             _phantom_arc: PhantomData,
             strategy,
         }
@@ -474,6 +692,203 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
         Guard { inner: protected }
     }
 
+    /// Claims the generation counter for a write, returning the held claim.
+    ///
+    /// Spins (without any locking or allocation) while another writer holds the claim. The
+    /// claim window of other writers is only a handful of instructions, so this is bounded in
+    /// practice.
+    fn claim_generation(&self) -> GenClaim<'_> {
+        loop {
+            let gen = self.gen.load(Ordering::SeqCst);
+            if gen % 2 == 0
+                && self
+                    .gen
+                    .compare_exchange_weak(gen, gen + 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                return GenClaim {
+                    gen: &self.gen,
+                    even: gen,
+                };
+            }
+            atomic::spin_loop_hint();
+        }
+    }
+
+    /// Loads the value, together with a token identifying the generation it was loaded from.
+    ///
+    /// This works just like [`load`](#method.load), but additionally returns an
+    /// [`Observation`] ‒ a cheap, copyable token capturing *which* generation of the value was
+    /// returned. The token does not keep the value alive and can be passed to
+    /// [`compare_exchange_observed`](#method.compare_exchange_observed) later to atomically
+    /// check that this exact generation is still the current one and replace it.
+    ///
+    /// # Performance
+    ///
+    /// Slightly more expensive than [`load`](#method.load) (two additional atomic reads and
+    /// fences around it). It may also need to retry for a few instructions if a writer is
+    /// just in the middle of replacing the value. If the token is not needed, prefer the
+    /// plain [`load`](#method.load), which is unaffected by this mechanism.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use arc_swap::ArcSwap;
+    /// let shared = ArcSwap::from_pointee(42);
+    /// let (guard, observation) = shared.load_observed();
+    /// assert_eq!(42, **guard);
+    /// // The generation is still current, so the conditional update succeeds.
+    /// assert!(shared.compare_exchange_observed(&observation, Arc::new(0)).is_ok());
+    /// assert_eq!(0, **shared.load());
+    /// ```
+    pub fn load_observed(&self) -> (Guard<T, S>, Observation<T::Base>) {
+        loop {
+            // Seqlock-style read: take the generation on both sides of the load. If a write
+            // overlapped, the generation either is odd or changed and we retry. The fences
+            // make sure neither the generation reads nor the load inside cross each other
+            // (some strategies use weaker orderings internally).
+            let gen_before = self.gen.load(Ordering::SeqCst);
+            if gen_before % 2 != 0 {
+                // A writer holds the claim right now. Its window is only a few instructions,
+                // so spin briefly.
+                atomic::spin_loop_hint();
+                continue;
+            }
+            atomic::fence(Ordering::SeqCst);
+            let guard = self.load();
+            atomic::fence(Ordering::SeqCst);
+            let gen_after = self.gen.load(Ordering::SeqCst);
+            if gen_before == gen_after {
+                let ptr = T::as_ptr(&guard);
+                let observation = Observation {
+                    gen: gen_before,
+                    ptr: ptr as usize,
+                    _phantom: PhantomData,
+                };
+                return (guard, observation);
+            }
+        }
+    }
+
+    /// Replaces the value, but only if the generation identified by `expected` is still
+    /// current.
+    ///
+    /// This is a generation-based variant of [`compare_and_swap`](#method.compare_and_swap).
+    /// The `expected` token comes from an earlier [`load_observed`](#method.load_observed)
+    /// (or from a previous call of this method). If no write operation happened on this
+    /// instance since that observation, `new` is stored and a fresh [`Observation`] of the
+    /// just-stored value is returned (it can be used to chain further conditional updates
+    /// without reloading).
+    ///
+    /// If anything was stored in the meantime ‒ even the very same [`Arc`] again, or a
+    /// different value that happened to reuse the same address ‒ the generation no longer
+    /// matches and nothing is stored. The returned [`ObservedError`] then contains the
+    /// *current* value and its observation (ready for an immediate retry), and gives the
+    /// `new` value back so it doesn't have to be reallocated.
+    ///
+    /// In other words, on success this acts like [`store`](#method.store), on failure like
+    /// [`load_observed`](#method.load_observed).
+    ///
+    /// # ABA guarantees
+    ///
+    /// Unlike pointer comparison, the generation check cannot be fooled by the value
+    /// switching `A -> B -> A` in between; every write advances the generation. The only
+    /// exception is the counter wrapping around after `usize::MAX / 2 + 1` writes, see
+    /// [`Observation`] for the exact bound. Within the bound, a stale token is always
+    /// detected.
+    ///
+    /// # Memory ordering
+    ///
+    /// All the generation operations use [`SeqCst`] ordering, consistent with the rest of the
+    /// crate, so successful updates and observations take part in the single global order of
+    /// operations on this instance.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use arc_swap::ArcSwap;
+    /// let shared = ArcSwap::from_pointee(0);
+    ///
+    /// // A read-modify-write cycle that cannot lose updates:
+    /// let (mut guard, mut observation) = shared.load_observed();
+    /// loop {
+    ///     let new = Arc::new(**guard + 1);
+    ///     match shared.compare_exchange_observed(&observation, new) {
+    ///         Ok(_new_observation) => break,
+    ///         Err(error) => {
+    ///             // Someone else stored in the meantime. Take the fresh value and
+    ///             // observation and retry (the returned `new` is dropped here).
+    ///             let (current, current_observation, _new) = error.into_parts();
+    ///             guard = current;
+    ///             observation = current_observation;
+    ///         }
+    ///     }
+    /// }
+    /// assert_eq!(1, **shared.load());
+    /// ```
+    ///
+    /// [`Arc`]: https://doc.rust-lang.org/std/sync/struct.Arc.html
+    /// [`SeqCst`]: https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html#variant.SeqCst
+    pub fn compare_exchange_observed(
+        &self,
+        expected: &Observation<T::Base>,
+        new: T,
+    ) -> Result<Observation<T::Base>, ObservedError<T, S>> {
+        // The commit decision is this single atomic: it succeeds only if the generation is
+        // still exactly the observed (even) one, and simultaneously claims it for us, so no
+        // other writer can touch the pointer until we release it.
+        if self
+            .gen
+            .compare_exchange(
+                expected.gen,
+                expected.gen.wrapping_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return Err(self.observed_error(new));
+        }
+        let claim = GenClaim {
+            gen: &self.gen,
+            even: expected.gen,
+        };
+        // While we hold the claim, the pointer cannot change. The generation match above
+        // guarantees it is still the observed one; check it defensively anyway (a token
+        // misused across instances could otherwise corrupt things).
+        if self.ptr.load(Ordering::SeqCst) != expected.ptr as *mut T::Base {
+            claim.release_unchanged();
+            return Err(self.observed_error(new));
+        }
+        let new_ptr = T::into_ptr(new);
+        // SeqCst to synchronize the timelines, same as in `swap`.
+        let old = self.ptr.swap(new_ptr, Ordering::SeqCst);
+        let new_gen = claim.release_changed();
+        unsafe {
+            self.strategy.wait_for_readers(old, &self.ptr);
+            // We took one ref count out of the storage.
+            T::dec(old);
+        }
+        Ok(Observation {
+            gen: new_gen,
+            ptr: new_ptr as usize,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Builds the failure value for [`compare_exchange_observed`], observing the current
+    /// generation.
+    fn observed_error(&self, new: T) -> ObservedError<T, S> {
+        let (current, observation) = self.load_observed();
+        ObservedError {
+            current,
+            observation,
+            new,
+        }
+    }
+
     /// Replaces the value inside this instance.
     ///
     /// Further loads will yield the new value. Uses [`swap`](#method.swap) internally.
@@ -484,11 +899,17 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
     /// Exchanges the value inside this instance.
     pub fn swap(&self, new: T) -> T {
         let new = T::into_ptr(new);
+        // Claim the generation before touching the pointer, so observations and conditional
+        // updates can rely on the (pointer, generation) pair changing atomically. This is a
+        // few atomics on top of the swap below, which is negligible compared to the cleanup
+        // (paying the debts) that follows.
+        let claim = self.claim_generation();
         // AcqRel needed to publish the target of the new pointer and get the target of the old
         // one.
         //
         // SeqCst to synchronize the time lines with the group counters.
         let old = self.ptr.swap(new, Ordering::SeqCst);
+        claim.release_changed();
         unsafe {
             self.strategy.wait_for_readers(old, &self.ptr);
             T::from_ptr(old)
@@ -516,7 +937,20 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
         C: AsRaw<T::Base>,
         S: CaS<T>,
     {
+        // Claim the generation around the whole operation. While claimed, no other writer can
+        // change the pointer, which both keeps the generation honest and makes the inner
+        // compare-and-swap succeed on the first attempt if it matches at all.
+        let current_raw = current.as_raw();
+        let claim = self.claim_generation();
         let protected = unsafe { self.strategy.compare_and_swap(&self.ptr, current, new) };
+        if T::as_ptr(protected.borrow()) == current_raw {
+            // The swap happened, advance the generation.
+            claim.release_changed();
+        } else {
+            // Nothing was stored, keep the generation as it was so unrelated tokens are not
+            // needlessly invalidated.
+            claim.release_unchanged();
+        }
         Guard { inner: protected }
     }
 
@@ -793,6 +1227,7 @@ impl<T> ArcSwapOption<T> {
     pub const fn const_empty() -> Self {
         Self {
             ptr: AtomicPtr::new(ptr::null_mut()),
+            gen: AtomicUsize::new(0),
             _phantom_arc: PhantomData,
             strategy: HybridStrategy {
                 _config: DefaultConfig,

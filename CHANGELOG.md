@@ -2,6 +2,18 @@
 
 * Document RefCnt must not panic (#208).
 
+Unreleased additions on top:
+
+* Add the optional generation-token API: `ArcSwapAny::load_observed` and
+  `ArcSwapAny::compare_exchange_observed`, together with the `Observation` and
+  `ObservedError` types. They allow conditional updates based on "the generation I read is
+  still current", immune to A-B-A pointer reuse (up to a documented, practically
+  unreachable wrap-around bound). The existing read paths (`load`, `load_full`) are
+  unaffected; writes pay a few extra atomic operations for maintaining the generation
+  counter. Works for `ArcSwap`, `ArcSwapOption` (including its `None`) and `ArcSwapWeak`.
+* Allow `internal-test-strategies` together with `experimental-thread-local` (the former
+  takes precedence) so `--all-features` builds work.
+
 # 1.9.1
 
 * One more SeqCst :-| (#204).

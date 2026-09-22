@@ -32,7 +32,10 @@ use core::slice::Iter;
 use core::sync::atomic::Ordering::*;
 use core::sync::atomic::{AtomicPtr, AtomicUsize};
 
-#[cfg(feature = "experimental-thread-local")]
+#[cfg(all(
+    feature = "experimental-thread-local",
+    not(feature = "internal-test-strategies")
+))]
 use core::cell::OnceCell;
 
 use crate::imports::Box;
@@ -219,7 +222,10 @@ pub(crate) struct LocalNode {
 }
 
 impl LocalNode {
-    #[cfg(not(feature = "experimental-thread-local"))]
+    #[cfg(any(
+        not(feature = "experimental-thread-local"),
+        feature = "internal-test-strategies"
+    ))]
     pub(crate) fn with<R, F: FnOnce(&LocalNode) -> R>(f: F) -> R {
         let f = Cell::new(Some(f));
         THREAD_HEAD
@@ -248,7 +254,10 @@ impl LocalNode {
             })
     }
 
-    #[cfg(feature = "experimental-thread-local")]
+    #[cfg(all(
+        feature = "experimental-thread-local",
+        not(feature = "internal-test-strategies")
+    ))]
     pub(crate) fn with<R, F: FnOnce(&LocalNode) -> R>(f: F) -> R {
         let thread_head = THREAD_HEAD.get_or_init(|| LocalNode {
             node: Cell::new(None),
@@ -332,7 +341,10 @@ impl Drop for LocalNode {
     }
 }
 
-#[cfg(not(feature = "experimental-thread-local"))]
+#[cfg(any(
+    not(feature = "experimental-thread-local"),
+    feature = "internal-test-strategies"
+))]
 thread_local! {
     /// A debt node assigned to this thread.
     static THREAD_HEAD: LocalNode = LocalNode {
@@ -342,7 +354,10 @@ thread_local! {
     };
 }
 
-#[cfg(feature = "experimental-thread-local")]
+#[cfg(all(
+    feature = "experimental-thread-local",
+    not(feature = "internal-test-strategies")
+))]
 #[thread_local]
 /// A debt node assigned to this thread.
 static THREAD_HEAD: OnceCell<LocalNode> = OnceCell::new();
